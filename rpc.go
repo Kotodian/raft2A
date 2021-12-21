@@ -1,15 +1,7 @@
 package main
 
-import (
-	"bytes"
-	"log"
-	"reflect"
-	"strings"
-	"sync"
-)
-
-// RequestVote 投票RPC
-type RequestVote struct {
+// RequestVoteReq 投票RPC
+type RequestVoteReq struct {
 	Term        int
 	CandidateId int
 
@@ -25,8 +17,8 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntries 复制日志以及心跳RPC
-type AppendEntries struct {
+// AppendEntriesReq 复制日志以及心跳RPC
+type AppendEntriesReq struct {
 	Term     int
 	LeaderId int
 
@@ -40,159 +32,68 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-type reqMsg struct {
-	endName  interface{}
-	svcMeth  string
-	argsType reflect.Type
-	args     []byte
-	replyCh  chan replyMsg
-}
+// RequestVote 拉票服务端逻辑
+func (r *RaftNode) RequestVote(req *RequestVoteReq, reply *RequestVoteReply) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-type replyMsg struct {
-	ok    bool
-	reply []byte
-}
-
-type ClientEnd struct {
-	endName interface{}
-	ch      chan reqMsg
-	done    chan struct{}
-}
-
-func (c *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
-	req := reqMsg{}
-	req.endName = c.endName
-	req.svcMeth = svcMeth
-	req.argsType = reflect.TypeOf(args)
-	req.replyCh = make(chan replyMsg)
-
-	select {
-	case c.ch <- req:
-	case <-c.done:
-		return false
+	if req.Term > r.currentTerm {
+		r.BecomeFollower()
+		r.currentTerm = req.Term
 	}
 
-	rep := <-req.replyCh
-	if rep.ok {
-		rb := bytes.NewBuffer(rep.reply)
-		rd := NewDecoder(rb)
-		if err := rd.Decode(reply); err != nil {
-			log.Fatalf("ClientEnd.Call(); decode reply: %v\n", err)
-		}
-		return true
-	} else {
-		return false
+	if req.Term < r.currentTerm || (r.votedFor != -1 && r.votedFor != req.CandidateId) {
+		DPrintf("[RequestVote] raft %d reject vote for %d | current term: %d | current state: %d | received term",
+			r.me, req.CandidateId, r.currentTerm, r.role, req.Term)
+		reply.Term = r.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	if r.votedFor == -1 || r.votedFor == req.CandidateId {
+		DPrintf("[RequestVote] raft %d accept vote for %d | current term: %d | current state: %d | received term",
+			r.me, req.CandidateId, r.currentTerm, r.role, req.Term)
+		reply.Term = r.currentTerm
+		reply.VoteGranted = true
+		r.votedFor = req.CandidateId
+		r.resetTimerElection()
 	}
 }
 
-type Network struct {
-	mu             sync.Mutex
-	reliable       bool
-	longDelays     bool
-	longReordering bool
-	ends           map[interface{}]*ClientEnd
-	enabled        map[interface{}]bool
-	connections    map[interface{}]interface{}
-	endCh          chan reqMsg
+// sendRequestVote 客户端调用拉票rpc
+func (r *RaftNode) sendRequestVote(server int, req *RequestVoteReq, reply *RequestVoteReply) bool {
+	ok := r.peers[server].Call("Raft.RequestVote", req, reply)
+	return ok
 }
 
-type Server struct {
-	mu       sync.Mutex
-	services map[string]*Service
-	count    int
-}
+// AppendEntries 日志复制/心跳rpc服务端逻辑
+func (r *RaftNode) AppendEntries(req *AppendEntriesReq, reply *AppendEntriesReply) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-func MakeServer() *Server {
-	rs := &Server{}
-	rs.services = map[string]*Service{}
-	return rs
-}
-
-func (s *Server) AddService(svc *Service) {
-	s.mu.Lock()
-	s.services[svc.name] = svc
-	s.mu.Unlock()
-}
-
-func (s *Server) dispatch(req reqMsg) replyMsg {
-	s.mu.Lock()
-
-	dot := strings.LastIndex(req.svcMeth, ".")
-	serviceName := req.svcMeth[:dot]
-	methodName := req.svcMeth[dot+1:]
-
-	service, ok := s.services[serviceName]
-
-	s.mu.Unlock()
-
-	if ok {
-		return service.dispatch(methodName, req)
-	} else {
-		choices := []string{}
-		for k, _ := range s.services {
-			choices = append(choices, k)
-		}
-		return replyMsg{}
+	if req.Term < r.currentTerm {
+		reply.Term = r.currentTerm
+		reply.Success = false
+		DPrintf("[AppendEntries] raft %d reject append entries | current term: %d | current state: %d | args term: %d",
+			r.me, r.currentTerm, r.role, req.Term)
+		return
 	}
-}
+	// 收到心跳包,更新选举超时时间
+	r.resetTimerElection()
 
-type Service struct {
-	name    string
-	rcvr    reflect.Value
-	typ     reflect.Type
-	methods map[string]reflect.Method
-}
-
-func MakeService(rcvr interface{}) *Service {
-	svc := &Service{}
-	svc.typ = reflect.TypeOf(rcvr)
-	svc.rcvr = reflect.ValueOf(rcvr)
-	svc.name = reflect.Indirect(svc.rcvr).Type().Name()
-
-	for m := 0; m < svc.typ.NumMethod(); m++ {
-		method := svc.typ.Method(m)
-		mtype := method.Type
-		mname := method.Name
-
-		if method.PkgPath != "" ||
-			mtype.NumIn() != 3 ||
-			mtype.In(2).Kind() != reflect.Ptr ||
-			mtype.NumOut() != 0 {
-
-		} else {
-			svc.methods[mname] = method
-		}
+	// 如果当前的任期小于请求的任期 那么自己必然是跟随者
+	if req.Term > r.currentTerm || r.role != Follower {
+		r.BecomeFollower()
+		r.currentTerm = req.Term
+		DPrintf("[AppendEntries] raft %d update term or state | current term: %d | current state: %d | args term: %d",
+			r.me, r.currentTerm, r.role, req.Term)
 	}
-	return svc
+	reply.Term = r.currentTerm
+	reply.Success = true
 }
 
-func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
-	if method, ok := svc.methods[methname]; ok {
-		args := reflect.New(req.argsType)
-
-		ab := bytes.NewBuffer(req.args)
-		ad := NewDecoder(ab)
-		ad.Decode(args.Interface())
-
-		replyType := method.Type.In(2)
-		replyType = replyType.Elem()
-		replyv := reflect.New(replyType)
-
-		function := method.Func
-		function.Call([]reflect.Value{svc.rcvr, args.Elem(), replyv})
-
-		rb := new(bytes.Buffer)
-		re := NewEncoder(rb)
-		re.EncodeValue(replyv)
-
-		return replyMsg{true, rb.Bytes()}
-	} else {
-		choices := make([]string, 0)
-		for k, _ := range svc.methods {
-			choices = append(choices, k)
-		}
-		log.Fatalf("unknown method %v in %v; expecting one of %v\n",
-			methname, req.svcMeth, choices)
-		return replyMsg{}
-	}
+// sendAppendEntries 客户端调用心跳/日志复制rpc
+func (r *RaftNode) sendAppendEntries(server int, req *AppendEntriesReq, reply *AppendEntriesReply) bool {
+	ok := r.peers[server].Call("Raft.AppendEntries", req, reply)
+	return ok
 }
